@@ -1,0 +1,96 @@
+# =============================================================================
+# Nutrisulin — Product Economics, Targets, Guardrails & Diagnostics config
+# =============================================================================
+# This file is the agent's "reward function" and safety envelope. The source
+# design doc is explicit: DO NOT hard-code generic supplement-industry
+# benchmarks. Targets below must be derived from Nutrisulin's real economics
+# and historical performance. Anything left as `null` is treated as
+# "UNSPECIFIED" — dependent KPIs will be reported as "requires config" rather
+# than guessed.
+#
+# Everything in `economics:` that depends on the store backend (real orders,
+# refunds, LTV, CAC) is a STUB for now — the current build only has Meta API
+# access. Contribution / breakeven ROAS are computed from Meta-attributed
+# purchases + the margin fields you fill in here, and are labelled as
+# "Meta-attributed estimates", not realized finance numbers.
+
+product:
+  product_id: NUTRISULIN
+  sku_ids: []
+  currency: USD
+  retail_price: null          # list price per unit
+  sale_price: null
+  subscription_price: null
+  bundle_prices: []           # e.g. [ {units: 3, price: 79.0} ]
+
+# ---- Unit economics: needed for contribution profit & breakeven ROAS --------
+# Provide EITHER absolute per-order costs OR a blended variable-cost ratio.
+# contribution_margin_ratio = (net_revenue - variable_costs) / net_revenue
+# breakeven_roas            = 1 / contribution_margin_ratio
+unit_economics:
+  cogs: null                  # cost of goods per unit
+  fulfillment_cost: null      # pick/pack per order
+  shipping_subsidy: null      # avg shipping cost you absorb per order
+  payment_fee_rate: null      # e.g. 0.029 for 2.9%
+  affiliate_fee_rate: null    # 0 if none
+  # If you can't itemise the above yet, set this directly (0.0-1.0) and the
+  # agent will use it for contribution math:
+  contribution_margin_ratio: null
+
+# ---- Business targets: the benchmarks for CPA / ROAS / contribution ---------
+targets:
+  cpa_target: null            # ALLOWABLE_CPA_FIRST_ORDER (Meta CPA ceiling)
+  cac_target: null            # ALLOWABLE_CAC_NEW_CUSTOMER
+  roas_floor: null            # minimum acceptable Meta ROAS
+  contribution_target: null   # TARGET_CONTRIBUTION_AFTER_ADS (per day/entity)
+  max_payback_days: null
+
+# ---- Decision guardrails: evidence + safety envelope (read-only for now) -----
+decision_guardrails:
+  min_impressions: 1000       # MIN_EVIDENCE components — tune to your volume
+  min_clicks: 50
+  min_purchases: 5
+  min_spend_multiple: 3.0     # require spend >= cpa_target * this before stop-loss
+  max_budget_step_pct: 0.20   # MAX_BUDGET_STEP_PCT (used by future write stage)
+  max_daily_downscale_pct: 0.30
+  cooldown_hours: 24          # COOLDOWN_HOURS after a significant edit
+  min_statistical_confidence: 0.80
+  inventory_floor_days: null  # INVENTORY_FLOOR_DAYS (needs inventory feed)
+  auto_approval_budget_limit: null
+
+# ---- Diagnostics thresholds: what counts as a "material" move vs baseline ----
+# Baselines themselves are computed from the account's own history, never
+# hard-coded. These are just the sensitivity knobs for calling a change real.
+diagnostics:
+  ctr_material_drop_pct: 0.20      # link CTR down >=20% vs baseline => attention
+  cpm_material_rise_pct: 0.20      # CPM up >=20% vs baseline => auction pressure
+  cvr_material_drop_pct: 0.20      # CVR down >=20% vs baseline => site/offer
+  cpa_over_target_pct: 0.15        # CPA >=15% over target => unprofitable flag
+  baseline_window_days: 7          # short baseline window (creative/placement)
+  baseline_long_window_days: 28    # long baseline window (CPM/auction context)
+
+# ---- Measurement / attribution discipline ----------------------------------
+measurement:
+  primary_attribution_window: 7d_click_1d_view
+  meta_purchase_event: purchase          # action_type to treat as a purchase
+  # CAPI coverage target from Meta guidance (~75%); measurement gate for future.
+  capi_coverage_target: 0.75
+  backend_order_source: null             # e.g. shopify (not yet integrated)
+  new_customer_definition: null
+
+# ---- Compliance gates (health/wellness product) ----------------------------
+compliance:
+  product_category: covered_health_wellness
+  minimum_age: 18                        # non-negotiable Meta gate where policy applies
+  approved_claim_ids: []
+  blocked_claim_ids: []
+  regulatory_review_required_for_new_copy: true
+  sensitive_health_data_to_meta: false
+
+# ---- External data sources not yet wired (Shopify/GA4/Stripe/ERP) ----------
+# Left here as an explicit map of what's missing so the agent can say so.
+external_sources:
+  ecommerce_backend: null    # realized orders, refunds, net revenue
+  analytics_ga4: null        # landing-page drop-off, onsite funnel
+  crm: null                  # new vs returning, cohort LTV
+  inventory_erp: null        # days on hand

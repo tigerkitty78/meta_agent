@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.egg-info/
+build/
+dist/
+
+# Local SQLite store (snapshots, rolling averages, change log) — machine-local state
+data/
+*.db
+*.db-wal
+*.db-shm
