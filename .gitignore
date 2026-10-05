@@ -12,3 +12,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Unrelated scratch output (not part of this project)
+scraped/

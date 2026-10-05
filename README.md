@@ -86,6 +86,30 @@ Restart Claude Desktop. The tools below appear under the 🔌 menu.
 | `record_changes` | Fetch + **store** all changes over a period (Meta Activity Log + snapshot-diff backstop) and output them. Idempotent. |
 | `show_changes` | View stored changes anytime — filter by level / entity / manual-only. |
 | `explain_metric_move` | Cross-reference a metric rise/drop against logged changes — as a **cautious association**, with confounder flags. |
+| `store_meta_recommendations` | Persist Ads-Manager UI recommendations (High CPR, Opportunity hints) — **UI-only, not in the API**, so browser-captured. |
+| `show_meta_recommendations` | View stored UI recommendations. |
+| `store_competitor_notes` | Persist competitor observations (creative/offer/price) browsed from Ad Library site or storefronts — observable facts only. |
+| `show_competitor_notes` | View stored competitor observations. |
+| `weekly_report` | **One-call weekly analysis:** blended KPIs vs targets + per-campaign verdicts + change digest + stored recommendations + competitor notes. |
+
+## Weekly report & browser-captured data
+
+`weekly_report` is the single weekly roll-up. Most of it is computed server-side
+(KPIs, verdicts, change digest). Two sections — **Meta recommendations** and
+**competitor notes** — are **not available via any Meta API**:
+
+- Ads-Manager recommendations ("High CPR", "N recommendations", Opportunity
+  score) are **UI-only**. Confirmed: the API drops the `recommendations` field
+  and the account `recommendations` edge is empty.
+- Competitor ad data isn't served by the Ad Library API for US commercial ads.
+
+So those two are **browser-captured**: in a Claude session with the browser, read
+them off Ads Manager / the Ad Library site / competitor storefronts, then call
+`store_meta_recommendations` / `store_competitor_notes` to persist them. The
+server can't drive the browser itself, so this is a **capture step you run**, not
+a silent cron job. Once stored, every `weekly_report` includes them (deduped per
+ISO week). Competitor notes must be **observable facts only** — never claimed
+competitor CPA/CTR/ROAS (not knowable).
 
 ## Memory (local SQLite store)
 

@@ -12,6 +12,7 @@ Nothing here talks to the network; callers pass already-fetched data in.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -71,6 +72,35 @@ CREATE TABLE IF NOT EXISTS change_log (
 );
 CREATE INDEX IF NOT EXISTS ix_change_level_time ON change_log(level, event_time);
 CREATE INDEX IF NOT EXISTS ix_change_entity ON change_log(entity_id, event_time);
+
+CREATE TABLE IF NOT EXISTS meta_recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    iso_week TEXT,
+    level TEXT,
+    entity_id TEXT,
+    entity_name TEXT,
+    recommendation TEXT,
+    flag TEXT,                         -- e.g. 'High CPR', 'opportunity'
+    source TEXT,                       -- default 'ads_manager_ui' (UI-only, not in API)
+    raw_json TEXT,
+    dedupe_key TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS ix_rec_time ON meta_recommendations(captured_at);
+
+CREATE TABLE IF NOT EXISTS competitor_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT NOT NULL,
+    iso_week TEXT,
+    competitor TEXT,
+    category TEXT,                     -- creative | offer | price | general
+    observation TEXT,
+    source TEXT,                       -- ad_library_web | storefront | manual
+    url TEXT,
+    raw_json TEXT,
+    dedupe_key TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS ix_comp_time ON competitor_notes(captured_at);
 """
 
 
@@ -222,7 +252,89 @@ def db_stats() -> dict[str, Any]:
         last = con.execute("SELECT MAX(event_time) AS t FROM change_log").fetchone()["t"]
         return {"path": str(db_path()), "snapshots": c("snapshots"),
                 "rolling_averages": c("rolling_averages"), "change_log": c("change_log"),
+                "meta_recommendations": c("meta_recommendations"),
+                "competitor_notes": c("competitor_notes"),
                 "latest_change_event_time": last}
+
+
+# --- UI-captured Meta recommendations & competitor notes -------------------
+def _iso_week() -> str:
+    y, w, _ = datetime.now(timezone.utc).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _dk(*parts: Any) -> str:
+    return hashlib.sha1("|".join("" if p is None else str(p) for p in parts).encode("utf-8")).hexdigest()
+
+
+def insert_recommendations(rows: Iterable[dict[str, Any]]) -> int:
+    """Store Ads-Manager UI recommendations. Deduped per entity+text+ISO week."""
+    init_db(); new = 0; wk = _iso_week()
+    with _conn() as con:
+        for r in rows:
+            key = r.get("dedupe_key") or _dk(r.get("level"), r.get("entity_id") or r.get("entity_name"),
+                                             r.get("recommendation"), wk)
+            try:
+                con.execute(
+                    """INSERT INTO meta_recommendations
+                       (captured_at, iso_week, level, entity_id, entity_name, recommendation,
+                        flag, source, raw_json, dedupe_key)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (_now(), wk, r.get("level", "campaign"), r.get("entity_id"), r.get("entity_name"),
+                     r.get("recommendation"), r.get("flag"), r.get("source", "ads_manager_ui"),
+                     json.dumps(r.get("raw")) if r.get("raw") is not None else None, key))
+                new += 1
+            except sqlite3.IntegrityError:
+                pass
+    return new
+
+
+def get_recommendations(since: str | None = None, level: str | None = None,
+                        entity_id: str | None = None, limit: int = 300) -> list[dict[str, Any]]:
+    init_db(); q = "SELECT * FROM meta_recommendations WHERE 1=1"; a: list[Any] = []
+    if since:
+        q += " AND captured_at >= ?"; a.append(since)
+    if level and level != "all":
+        q += " AND level = ?"; a.append(level)
+    if entity_id:
+        q += " AND entity_id = ?"; a.append(entity_id)
+    q += " ORDER BY captured_at DESC LIMIT ?"; a.append(limit)
+    with _conn() as con:
+        return [dict(r) for r in con.execute(q, a).fetchall()]
+
+
+def insert_competitor_notes(rows: Iterable[dict[str, Any]]) -> int:
+    """Store competitor observations. Deduped per competitor+text+ISO week."""
+    init_db(); new = 0; wk = _iso_week()
+    with _conn() as con:
+        for r in rows:
+            key = r.get("dedupe_key") or _dk(r.get("competitor"), r.get("category"),
+                                             r.get("observation"), wk)
+            try:
+                con.execute(
+                    """INSERT INTO competitor_notes
+                       (captured_at, iso_week, competitor, category, observation, source, url,
+                        raw_json, dedupe_key)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (_now(), wk, r.get("competitor"), r.get("category", "general"),
+                     r.get("observation"), r.get("source", "manual"), r.get("url"),
+                     json.dumps(r.get("raw")) if r.get("raw") is not None else None, key))
+                new += 1
+            except sqlite3.IntegrityError:
+                pass
+    return new
+
+
+def get_competitor_notes(since: str | None = None, competitor: str | None = None,
+                         limit: int = 300) -> list[dict[str, Any]]:
+    init_db(); q = "SELECT * FROM competitor_notes WHERE 1=1"; a: list[Any] = []
+    if since:
+        q += " AND captured_at >= ?"; a.append(since)
+    if competitor:
+        q += " AND competitor = ?"; a.append(competitor)
+    q += " ORDER BY captured_at DESC LIMIT ?"; a.append(limit)
+    with _conn() as con:
+        return [dict(r) for r in con.execute(q, a).fetchall()]
 
 
 def _s(v: Any) -> str | None:

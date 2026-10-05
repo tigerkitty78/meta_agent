@@ -639,6 +639,136 @@ def _fmt_changes(rows: list[dict]) -> list[dict]:
     return out
 
 
+@mcp.tool()
+async def store_meta_recommendations(recommendations: list[dict]) -> str:
+    """Save Meta Ads Manager's on-screen recommendations so the weekly report
+    can include them. These ('High CPR', 'N recommendations', Opportunity-score
+    hints) are UI-ONLY — not in the Marketing API — so they must be captured
+    from the Ads Manager screen (via the browser) and persisted here.
+
+    Each item: {entity_name, recommendation, and optionally entity_id, level
+    (campaign/adset/ad), flag}. Deduped per entity+text+ISO week, so re-running
+    the same week won't pile up duplicates."""
+    if not recommendations:
+        return _err("No recommendations provided. Capture them from Ads Manager first.")
+    n = store.insert_recommendations(recommendations)
+    return _dump({"received": len(recommendations), "stored_new": n,
+                  "source": "ads_manager_ui (browser-captured; not available via API)",
+                  "note": "Included automatically in weekly_report."})
+
+
+@mcp.tool()
+async def show_meta_recommendations(days: int = 14, level: str = "all",
+                                    entity_id: str | None = None) -> str:
+    """Show stored Ads-Manager recommendations captured in the last `days`."""
+    since, _ = _period_dates(days)
+    rows = store.get_recommendations(since=since, level=level, entity_id=entity_id)
+    return _dump({"since": since, "level": level, "count": len(rows),
+                  "recommendations": [{
+                      "when": r["captured_at"], "level": r["level"],
+                      "entity": r["entity_name"] or r["entity_id"],
+                      "recommendation": r["recommendation"], "flag": r["flag"],
+                      "source": r["source"]} for r in rows]})
+
+
+@mcp.tool()
+async def store_competitor_notes(notes: list[dict]) -> str:
+    """Save competitor observations for the weekly report. Competitor data is
+    NOT available via the Meta API, so notes come from browsing the Ad Library
+    website or competitor storefronts (creative, offers, pricing). Keep it to
+    OBSERVABLE facts — never claimed competitor CPA/CTR/ROAS.
+
+    Each item: {competitor, observation, and optionally category
+    (creative/offer/price/general), source (ad_library_web/storefront/manual),
+    url}. Deduped per competitor+text+ISO week."""
+    if not notes:
+        return _err("No competitor notes provided.")
+    n = store.insert_competitor_notes(notes)
+    return _dump({"received": len(notes), "stored_new": n,
+                  "note": "Included automatically in weekly_report. Observable facts only — "
+                          "no competitor performance metrics (not knowable)."})
+
+
+@mcp.tool()
+async def show_competitor_notes(days: int = 30, competitor: str | None = None) -> str:
+    """Show stored competitor observations captured in the last `days`."""
+    since, _ = _period_dates(days)
+    rows = store.get_competitor_notes(since=since, competitor=competitor)
+    return _dump({"since": since, "count": len(rows), "competitor_notes": [{
+        "when": r["captured_at"], "competitor": r["competitor"], "category": r["category"],
+        "observation": r["observation"], "source": r["source"], "url": r["url"]} for r in rows]})
+
+
+@mcp.tool()
+async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = True) -> str:
+    """The Meta weekly analysis, assembled in one call: blended account KPIs vs
+    targets, per-campaign SCALE/HOLD/FIX/STOP verdicts, the manual-change digest,
+    plus the browser-captured Meta recommendations and competitor notes.
+
+    Note: the recommendations & competitor sections reflect whatever was last
+    captured via store_meta_recommendations / store_competitor_notes — they are
+    UI/external data the server cannot fetch itself. Run that capture step (with
+    the browser) to refresh them before the report."""
+    try:
+        daily = await _client.get_insights("campaign", date_preset="last_28d", time_increment=1)
+    except MetaAPIError as exc:
+        return _err(str(exc))
+
+    margin = _margin()
+    id_field, name_field = LEVEL_ID_FIELD["campaign"], LEVEL_NAME_FIELD["campaign"]
+    groups: dict[str, list[dict]] = {}
+    names: dict[str, str] = {}
+    for r in daily:
+        eid = r.get(id_field)
+        if not eid:
+            continue
+        groups.setdefault(eid, []).append(r)
+        names[eid] = r.get(name_field) or names.get(eid, "")
+
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+    recent_rows = [r for r in daily if (r.get("date_start") or "") >= cutoff]
+    blended = compute_kpis(aggregate_rows(recent_rows), margin) if recent_rows else {}
+
+    verdicts = []
+    if include_verdicts:
+        ranked = sorted(groups.items(),
+                        key=lambda kv: sum(float(r.get("spend") or 0) for r in kv[1]), reverse=True)
+        for eid, rows in ranked:
+            hrs = _hours_since(store.last_change_time("campaign", eid, manual_only=True))
+            v = rolling_verdict("campaign", rows, margin, 7, hours_since_last_edit=hrs)
+            verdicts.append({"id": eid, "name": names.get(eid), "verdict": v.get("verdict"),
+                             "reason": v.get("reason"), "long_term_trend": v.get("long_term_trend"),
+                             "top_fixes": [f["fix"] for f in v.get("fixes", [])[:2]]})
+
+    since7, _ = _period_dates(7)
+    changes = store.get_changes(since=since7, manual_only=True, limit=500)
+    by_actor: dict[str, int] = {}
+    for c in changes:
+        by_actor[c.get("actor")] = by_actor.get(c.get("actor"), 0) + 1
+
+    recs = store.get_recommendations(since=_period_dates(14)[0])
+    notes = store.get_competitor_notes(since=_period_dates(30)[0])
+
+    return _dump({
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "period": date_preset,
+        "blended_kpis": blended,
+        "target_evaluation": evaluate_targets(blended) if blended else {},
+        "profitability": profitability_summary(),
+        "campaign_verdicts": verdicts,
+        "change_digest": {"manual_changes_7d": len(changes), "by_actor": by_actor},
+        "meta_recommendations": [{"entity": r["entity_name"] or r["entity_id"],
+                                  "recommendation": r["recommendation"], "flag": r["flag"],
+                                  "when": r["captured_at"]} for r in recs],
+        "competitor_notes": [{"competitor": r["competitor"], "category": r["category"],
+                              "observation": r["observation"], "source": r["source"],
+                              "when": r["captured_at"]} for r in notes],
+        "capture_reminder": ("meta_recommendations & competitor_notes are browser-captured (UI/"
+                             "external). If stale, refresh via store_meta_recommendations / "
+                             "store_competitor_notes before relying on this report."),
+    })
+
+
 def main() -> None:
     mcp.run()
 
