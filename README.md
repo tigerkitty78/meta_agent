@@ -90,7 +90,27 @@ Restart Claude Desktop. The tools below appear under the 🔌 menu.
 | `show_meta_recommendations` | View stored UI recommendations. |
 | `store_competitor_notes` | Persist competitor observations (creative/offer/price) browsed from Ad Library site or storefronts — observable facts only. |
 | `show_competitor_notes` | View stored competitor observations. |
-| `weekly_report` | **One-call weekly analysis:** blended KPIs vs targets + per-campaign verdicts + change digest + stored recommendations + competitor notes. |
+| `weekly_report` | **One-call weekly analysis:** funnel gates + blended KPIs vs targets + per-campaign verdicts + change digest + stored recommendations + competitor notes. |
+| `explain_gates` | The six funnel gates with **full transparency** — atomic fields, formula, and the exact numbers substituted. |
+
+## Funnel gates (with atomic-value transparency)
+
+`explain_gates` (and the `gates_blended` / per-campaign `gates` sections of
+`weekly_report`) compute the Amazon-style funnel gates, translated to Meta, and
+for each one show the **atomic Meta fields used**, the **formula**, and the
+**exact numbers substituted** — so every figure is auditable.
+
+| Gate | Formula | Atomic values | Available |
+|------|---------|---------------|-----------|
+| Visibility (Impressions) | `impressions` | impressions | ✅ |
+| Click (CTR) | `link_clicks / impressions * 100` | inline_link_clicks, impressions | ✅ |
+| Conversion (CVR) | `purchases / landing_page_views * 100` | purchases, landing_page_views | ✅ |
+| Paid Efficiency (ACoS) | `spend / purchase_value * 100` (= 100/ROAS) | spend, purchase_value | ✅ |
+| Ad Dependency (TACoS) | `spend / total_store_revenue * 100` | spend, **total store revenue** | ⚠️ pass `total_store_revenue` (Meta has no organic sales) |
+| Profit | `purchase_value * margin - spend` | purchase_value, spend, **margin** | ⚠️ needs `contribution_margin_ratio` in config |
+
+TACoS and Profit are **blocked** until their external input is provided — the
+tool returns the formula with a `BLOCKED` computation rather than guessing.
 
 ## Weekly report & browser-captured data
 

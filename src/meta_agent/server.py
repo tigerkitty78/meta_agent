@@ -21,6 +21,7 @@ from .baselines import baseline_stats, compare_to_baseline, daily_series
 from .config import get_compliance, get_guardrails, load_economics
 from .diagnostics import evaluate_targets, evidence_sufficient, root_cause_tree
 from .fixes import DISCLAIMER, FIXES, get_fixes
+from .gates import compute_gates
 from .kpi_dictionary import KPI_DICTIONARY, LEVEL_FOCUS, kpis_for_level
 from .kpis import aggregate_rows, compute_kpis
 from .meta_client import (LEVEL_ID_FIELD, LEVEL_NAME_FIELD, MetaAPIError,
@@ -700,10 +701,16 @@ async def show_competitor_notes(days: int = 30, competitor: str | None = None) -
 
 
 @mcp.tool()
-async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = True) -> str:
-    """The Meta weekly analysis, assembled in one call: blended account KPIs vs
+async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = True,
+                        total_store_revenue: float | None = None) -> str:
+    """The Meta weekly analysis, assembled in one call: the six funnel GATES
+    (Visibility -> Click -> Conversion -> Paid Efficiency -> Ad Dependency ->
+    Profit) with their atomic values and exact formulas, blended account KPIs vs
     targets, per-campaign SCALE/HOLD/FIX/STOP verdicts, the manual-change digest,
     plus the browser-captured Meta recommendations and competitor notes.
+
+    `total_store_revenue` (optional): pass your TOTAL store revenue (organic +
+    paid) for the period to unlock the TACoS gate — Meta can't provide it.
 
     Note: the recommendations & competitor sections reflect whatever was last
     captured via store_meta_recommendations / store_competitor_notes — they are
@@ -736,9 +743,12 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
         for eid, rows in ranked:
             hrs = _hours_since(store.last_change_time("campaign", eid, manual_only=True))
             v = rolling_verdict("campaign", rows, margin, 7, hours_since_last_edit=hrs)
+            recent_c = [r for r in rows if (r.get("date_start") or "") >= cutoff]
+            gates = compute_gates(aggregate_rows(recent_c), margin, total_store_revenue) if recent_c else None
             verdicts.append({"id": eid, "name": names.get(eid), "verdict": v.get("verdict"),
                              "reason": v.get("reason"), "long_term_trend": v.get("long_term_trend"),
-                             "top_fixes": [f["fix"] for f in v.get("fixes", [])[:2]]})
+                             "top_fixes": [f["fix"] for f in v.get("fixes", [])[:2]],
+                             "gates": gates})
 
     since7, _ = _period_dates(7)
     changes = store.get_changes(since=since7, manual_only=True, limit=500)
@@ -749,9 +759,13 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
     recs = store.get_recommendations(since=_period_dates(14)[0])
     notes = store.get_competitor_notes(since=_period_dates(30)[0])
 
+    gates_blended = compute_gates(aggregate_rows(recent_rows), margin,
+                                  total_store_revenue) if recent_rows else None
+
     return _dump({
         "generated": datetime.now(timezone.utc).isoformat(),
         "period": date_preset,
+        "gates_blended": gates_blended,
         "blended_kpis": blended,
         "target_evaluation": evaluate_targets(blended) if blended else {},
         "profitability": profitability_summary(),
@@ -766,6 +780,39 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
         "capture_reminder": ("meta_recommendations & competitor_notes are browser-captured (UI/"
                              "external). If stale, refresh via store_meta_recommendations / "
                              "store_competitor_notes before relying on this report."),
+    })
+
+
+@mcp.tool()
+async def explain_gates(level: str = "campaign", entity_id: str | None = None,
+                        date_preset: str = "last_7d",
+                        total_store_revenue: float | None = None) -> str:
+    """The six funnel GATES (Visibility, Click, Conversion, Paid Efficiency/ACoS,
+    Ad Dependency/TACoS, Profit) with FULL transparency: for each, the atomic
+    Meta fields used, the formula, and the exact numbers substituted.
+
+    Omit entity_id for the blended account view, or pass one campaign/adset/ad.
+    `total_store_revenue` (optional) unlocks the TACoS gate (Meta can't supply
+    total organic+paid revenue). Profit needs contribution_margin_ratio in config."""
+    if level not in _VALID_LEVELS:
+        return _err(f"level must be one of {'/'.join(_VALID_LEVELS)}")
+    try:
+        rows = await _client.get_insights(level, date_preset=date_preset,
+                                          entity_ids=[entity_id] if entity_id else None)
+    except MetaAPIError as exc:
+        return _err(str(exc))
+    if not rows:
+        return _err(f"No insights for {level}"
+                    + (f" {entity_id}" if entity_id else "") + f" in {date_preset}.")
+    margin = _margin()
+    agg = aggregate_rows(rows)
+    result = compute_gates(agg, margin, total_store_revenue)
+    return _dump({
+        "level": level, "entity_id": entity_id, "date_preset": date_preset,
+        "entities_aggregated": len(rows),
+        "contribution_margin_ratio": margin,
+        "total_store_revenue_supplied": total_store_revenue,
+        **result,
     })
 
 
