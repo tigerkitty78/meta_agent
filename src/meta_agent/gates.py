@@ -131,3 +131,42 @@ def compute_gates(raw: dict[str, Any], margin: float | None = None,
     blocked = [g["gate"] for g in gates if g["value"] is None]
     return {"gates": gates, "blocked": blocked,
             "atomic_source": "Meta Insights API (one aggregated row for the period)"}
+
+
+def _fmt_value(g: dict[str, Any]) -> str:
+    v, unit = g.get("value"), g.get("unit", "")
+    if v is None:
+        return "**BLOCKED**"
+    if unit == "%":
+        return f"{v}%"
+    if unit == "count":
+        return f"{int(v):,}"
+    return str(v)
+
+
+def gates_markdown(result: dict[str, Any],
+                   title: str = "GATES (audit) — atomic values & exact formulas") -> str:
+    """Pre-rendered markdown table so the calling model can surface the gate
+    breakdown verbatim instead of summarising the numbers away."""
+    lines = [f"### {title}", "",
+             "| Gate | Formula | Computation (atomic values substituted) | Value |",
+             "|---|---|---|---|"]
+    for g in result["gates"]:
+        comp = str(g["computation"]).replace("|", "\\|")
+        lines.append(f"| {g['gate']} | `{g['formula']}` | `{comp}` | {_fmt_value(g)} |")
+    if result.get("blocked"):
+        lines.append("")
+        lines.append(f"_Blocked (missing input — reported, never guessed): "
+                     f"{', '.join(result['blocked'])}._")
+    return "\n".join(lines)
+
+
+def gates_audit_block(result: dict[str, Any], title: str | None = None) -> dict[str, Any]:
+    """The render-verbatim wrapper embedded in tool output."""
+    return {
+        "render_verbatim": True,
+        "instruction": ("Render this GATES (audit) block verbatim in your reply — do not "
+                        "summarise, re-round, reorder, or omit any row. It is the auditable "
+                        "atomic-value + formula breakdown behind each KPI."),
+        "markdown": gates_markdown(result, title) if title else gates_markdown(result),
+    }

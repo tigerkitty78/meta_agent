@@ -112,6 +112,11 @@ for each one show the **atomic Meta fields used**, the **formula**, and the
 TACoS and Profit are **blocked** until their external input is provided — the
 tool returns the formula with a `BLOCKED` computation rather than guessing.
 
+Both `weekly_report` and `explain_gates` also return a **`gates_audit`** block —
+a pre-rendered markdown table plus a `render_verbatim` instruction — so a
+summarising model surfaces the atomic-value/formula breakdown exactly rather
+than folding the numbers into prose.
+
 ## Weekly report & browser-captured data
 
 `weekly_report` is the single weekly roll-up. Most of it is computed server-side

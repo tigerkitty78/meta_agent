@@ -21,7 +21,7 @@ from .baselines import baseline_stats, compare_to_baseline, daily_series
 from .config import get_compliance, get_guardrails, load_economics
 from .diagnostics import evaluate_targets, evidence_sufficient, root_cause_tree
 from .fixes import DISCLAIMER, FIXES, get_fixes
-from .gates import compute_gates
+from .gates import compute_gates, gates_audit_block
 from .kpi_dictionary import KPI_DICTIONARY, LEVEL_FOCUS, kpis_for_level
 from .kpis import aggregate_rows, compute_kpis
 from .meta_client import (LEVEL_ID_FIELD, LEVEL_NAME_FIELD, MetaAPIError,
@@ -765,6 +765,8 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
     return _dump({
         "generated": datetime.now(timezone.utc).isoformat(),
         "period": date_preset,
+        "gates_audit": gates_audit_block(gates_blended, "GATES (audit) — blended, last 7 days")
+                       if gates_blended else None,
         "gates_blended": gates_blended,
         "blended_kpis": blended,
         "target_evaluation": evaluate_targets(blended) if blended else {},
@@ -807,11 +809,13 @@ async def explain_gates(level: str = "campaign", entity_id: str | None = None,
     margin = _margin()
     agg = aggregate_rows(rows)
     result = compute_gates(agg, margin, total_store_revenue)
+    label = f"GATES (audit) — {entity_id or 'blended'} ({date_preset})"
     return _dump({
         "level": level, "entity_id": entity_id, "date_preset": date_preset,
         "entities_aggregated": len(rows),
         "contribution_margin_ratio": margin,
         "total_store_revenue_supplied": total_store_revenue,
+        "gates_audit": gates_audit_block(result, label),
         **result,
     })
 
