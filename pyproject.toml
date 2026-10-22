@@ -19,3 +19,10 @@ nutrisulin-meta-agent = "meta_agent.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]

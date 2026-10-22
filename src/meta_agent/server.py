@@ -27,7 +27,7 @@ from .kpis import aggregate_rows, compute_kpis
 from .meta_client import (LEVEL_ID_FIELD, LEVEL_NAME_FIELD, MetaAPIError,
                           MetaClient)
 from .profitability import contribution_margin_ratio, profitability_summary
-from . import store
+from . import competitors, store
 from .verdict import rolling_verdict
 
 mcp = FastMCP("nutrisulin-meta-agent")
@@ -674,10 +674,11 @@ async def show_meta_recommendations(days: int = 14, level: str = "all",
 
 @mcp.tool()
 async def store_competitor_notes(notes: list[dict]) -> str:
-    """Save competitor observations for the weekly report. Competitor data is
-    NOT available via the Meta API, so notes come from browsing the Ad Library
-    website or competitor storefronts (creative, offers, pricing). Keep it to
-    OBSERVABLE facts — never claimed competitor CPA/CTR/ROAS.
+    """Save MANUAL competitor observations for the weekly report — e.g.
+    storefront pricing/offers or ad body copy read off the Ad Library site.
+    (Ad Library ads themselves are pulled weekly via competitor_scan_plan ->
+    connector -> ingest_ad_library_results.) Keep it to OBSERVABLE facts —
+    never claimed competitor CPA/CTR/ROAS.
 
     Each item: {competitor, observation, and optionally category
     (creative/offer/price/general), source (ad_library_web/storefront/manual),
@@ -700,6 +701,87 @@ async def show_competitor_notes(days: int = 30, competitor: str | None = None) -
         "observation": r["observation"], "source": r["source"], "url": r["url"]} for r in rows]})
 
 
+_SCAN_STEPS = (
+    "1) For EACH item in `plan`, call the Meta Ads connector tool "
+    f"`{competitors.CONNECTOR_TOOL}` with exactly `args` (advertiser_job="
+    "creative_insights_and_ideas). 2) Call ingest_ad_library_results ONCE with "
+    "scans=[{query_id, results: <the connector's raw response>}, ...] covering every "
+    "query, including ones that returned no ads. 3) Then call weekly_report.")
+
+
+@mcp.tool()
+async def competitor_scan_plan() -> str:
+    """WEEKLY RUN, STEP 1 (competitor data). Returns the Meta Ad Library queries
+    for this week's NutriSulin competitor scan (category keyword sweeps +
+    tracked brands from config/competitors.yaml). This server can't reach the
+    Meta Ads connector itself; the caller runs each query through the
+    connector's ads_library_search tool and hands the raw results to
+    ingest_ad_library_results."""
+    plan = competitors.scan_plan()
+    if not plan:
+        return _err("No queries configured: add search_terms/tracked to config/competitors.yaml.")
+    last = store.latest_ad_library_scan()
+    return _dump({"iso_week": store.current_iso_week(),
+                  "last_scan": {"scanned_at": last["scanned_at"], "iso_week": last["iso_week"]}
+                               if last else None,
+                  "connector_tool": competitors.CONNECTOR_TOOL,
+                  "plan": plan, "steps": _SCAN_STEPS})
+
+
+@mcp.tool()
+async def ingest_ad_library_results(scans: list[dict]) -> str:
+    """WEEKLY RUN, STEP 2 (competitor data). Ingest raw Meta Ad Library results
+    pulled through the Meta Ads connector (ads_library_search).
+
+    `scans`: [{query_id (from competitor_scan_plan), results (the connector's
+    raw response: as returned, or its decoded {"ads": [...]})}, ...].
+
+    Filters off-topic and own-page ads, stores every ad (tracking first-seen so
+    new launches are visible week over week), summarises per competitor (active
+    ads, new this scan, longevity, headline & offer signals) and refreshes this
+    week's competitor_notes so weekly_report includes them. Observable Ad
+    Library facts only; competitor spend/CTR/CPA/ROAS aren't public."""
+    if not scans:
+        return _err("No scans provided. Run competitor_scan_plan and the connector queries first.")
+    ads, drops = competitors.classify(scans)
+    raw_total = sum(len(competitors.parse_connector_output(s.get("results"))) for s in scans)
+    scan_id = f"{store.current_iso_week()}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+    query_ids = [str(s.get("query_id")) for s in scans]
+    store.record_ad_library_scan(scan_id, query_ids, ads, drops)
+    summary = competitors.summarize(store.get_scan_ads(scan_id), scan_id)
+    store.set_scan_summary(scan_id, summary)
+    n = store.replace_week_notes("meta_ad_library_connector",
+                                 competitors.notes_from_summary(summary))
+    planned = {p["query_id"] for p in competitors.scan_plan()}
+    return _dump({"scan_id": scan_id, "ads_received": raw_total, "ads_kept": len(ads),
+                  "dropped": drops, "missing_queries": sorted(planned - set(query_ids)),
+                  "competitor_notes_written": n, "summary": summary,
+                  "note": "Included automatically in weekly_report (competitor_scan section)."})
+
+
+def _competitor_scan_section() -> dict[str, Any]:
+    last = store.latest_ad_library_scan()
+    week = store.current_iso_week()
+    if not last or last["iso_week"] != week:
+        return {"status": "STALE" if last else "NEVER_RUN",
+                "last_scanned_at": last["scanned_at"] if last else None,
+                "pre_run_required": ("Competitor data is not from this ISO week. Before "
+                                     "presenting the report: call competitor_scan_plan, run its "
+                                     "queries through the Meta Ads connector, call "
+                                     "ingest_ad_library_results, then call weekly_report again."),
+                "steps": _SCAN_STEPS}
+    summary = json.loads(last["summary_json"] or "{}")
+    return {"status": "FRESH", "scanned_at": last["scanned_at"], "iso_week": last["iso_week"],
+            "ads_kept": last["ads_kept"], "dropped": json.loads(last["drops_json"] or "{}"),
+            "category_signal_counts": summary.get("category_signal_counts"),
+            "competitors": [{k: c[k] for k in ("competitor", "active_ads_seen", "new_ads_this_scan",
+                                               "durable_ads", "oldest_running_days",
+                                               "top_headlines", "signals", "examples")}
+                            for c in summary.get("competitors", [])[:15]],
+            "caveat": ("Ad Library shows what competitors run, not how it performs. "
+                       "Longevity (durable ads) is the only public proxy for a working ad.")}
+
+
 @mcp.tool()
 async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = True,
                         total_store_revenue: float | None = None) -> str:
@@ -712,10 +794,15 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
     `total_store_revenue` (optional): pass your TOTAL store revenue (organic +
     paid) for the period to unlock the TACoS gate — Meta can't provide it.
 
-    Note: the recommendations & competitor sections reflect whatever was last
-    captured via store_meta_recommendations / store_competitor_notes — they are
-    UI/external data the server cannot fetch itself. Run that capture step (with
-    the browser) to refresh them before the report."""
+    COMPETITOR STEP (run first each week): competitor data comes from the Meta
+    Ad Library via the Meta Ads connector, which this server can't call. If
+    `competitor_scan.status` isn't FRESH, run competitor_scan_plan -> the
+    connector's ads_library_search per query -> ingest_ad_library_results,
+    then call weekly_report again. Report the competitor_scan section as its
+    own "Competitor ads (Meta Ad Library)" block.
+
+    The recommendations section reflects whatever was last captured via
+    store_meta_recommendations (Ads Manager UI only, browser-captured)."""
     try:
         daily = await _client.get_insights("campaign", date_preset="last_28d", time_increment=1)
     except MetaAPIError as exc:
@@ -776,12 +863,13 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
         "meta_recommendations": [{"entity": r["entity_name"] or r["entity_id"],
                                   "recommendation": r["recommendation"], "flag": r["flag"],
                                   "when": r["captured_at"]} for r in recs],
+        "competitor_scan": _competitor_scan_section(),
         "competitor_notes": [{"competitor": r["competitor"], "category": r["category"],
                               "observation": r["observation"], "source": r["source"],
-                              "when": r["captured_at"]} for r in notes],
-        "capture_reminder": ("meta_recommendations & competitor_notes are browser-captured (UI/"
-                             "external). If stale, refresh via store_meta_recommendations / "
-                             "store_competitor_notes before relying on this report."),
+                              "url": r["url"], "when": r["captured_at"]} for r in notes],
+        "capture_reminder": ("meta_recommendations are browser-captured (Ads Manager UI only); "
+                             "refresh via store_meta_recommendations if stale. Competitor data: "
+                             "see competitor_scan.status."),
     })
 
 
@@ -817,6 +905,88 @@ async def explain_gates(level: str = "campaign", entity_id: str | None = None,
         "total_store_revenue_supplied": total_store_revenue,
         "gates_audit": gates_audit_block(result, label),
         **result,
+    })
+
+
+BREAKDOWN_MAP = {
+    "placement": ["publisher_platform", "platform_position"],
+    "platform": ["publisher_platform"],
+    "device": ["impression_device"],
+    "demographic": ["age", "gender"],
+    "country": ["country"],
+    "hour": ["hourly_stats_aggregated_by_advertiser_time_zone"],
+}
+
+
+@mcp.tool()
+async def breakdown_kpis(by: str = "placement", level: str = "campaign",
+                         entity_id: str | None = None, date_preset: str = "last_7d",
+                         limit: int = 15) -> str:
+    """Split performance by a dimension the blended KPIs hide, and compare each
+    segment to the blended average.
+
+    `by`: placement (FB/IG x Feed/Reels/Stories) · platform · device ·
+    demographic (age+gender) · country · hour. Raw CTR is NOT comparable across
+    Reels, Feed and Stories, so each segment also carries its % difference from
+    the blended average (cpm/cpa: lower is better; ctr/roas: higher is better).
+
+    `level` is campaign/adset/ad. Omit `entity_id` for an account-wide view
+    (all entities at that level, aggregated by the breakdown)."""
+    if by not in BREAKDOWN_MAP:
+        return _err(f"by must be one of {'/'.join(BREAKDOWN_MAP)}")
+    if level not in _VALID_LEVELS:
+        return _err(f"level must be one of {'/'.join(_VALID_LEVELS)}")
+    dims = BREAKDOWN_MAP[by]
+    try:
+        rows = await _client.get_insights(
+            level, date_preset=date_preset, breakdowns=dims,
+            entity_ids=[entity_id] if entity_id else None)
+    except MetaAPIError as exc:
+        return _err(str(exc))
+    if not rows:
+        return _err(f"No insights for a {by} breakdown ({level}, {date_preset}).")
+
+    margin = _margin()
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        key = tuple(r.get(d) for d in dims)
+        groups.setdefault(key, []).append(r)
+    blended = compute_kpis(aggregate_rows(rows), margin)
+
+    def _delta(seg: float | None, base: float | None) -> float | None:
+        if seg is None or not base:
+            return None
+        return round((seg - base) / base, 3)
+
+    segments = []
+    for key, rs in groups.items():
+        k = compute_kpis(aggregate_rows(rs), margin)
+        segments.append({
+            "segment": " · ".join("?" if x is None else str(x) for x in key),
+            "spend": k["spend"], "impressions": k["impressions"],
+            "ctr_link": k["ctr_link"], "cpm": k["cpm"], "cpc_link": k["cpc_link"],
+            "cvr_lpv_to_purchase": k["cvr_lpv_to_purchase"],
+            "meta_purchases": k["meta_purchases"], "cpa_meta": k["cpa_meta"],
+            "meta_roas": k["meta_roas"],
+            "vs_blended": {
+                "cpm_delta_pct": _delta(k["cpm"], blended["cpm"]),
+                "ctr_link_delta_pct": _delta(k["ctr_link"], blended["ctr_link"]),
+                "cpa_delta_pct": _delta(k["cpa_meta"], blended["cpa_meta"]),
+                "roas_delta_pct": _delta(k["meta_roas"], blended["meta_roas"]),
+            },
+        })
+    segments.sort(key=lambda s: s["spend"], reverse=True)
+
+    return _dump({
+        "by": by, "breakdowns": dims, "level": level, "entity_id": entity_id,
+        "date_preset": date_preset, "contribution_margin_ratio": margin,
+        "segments_count": len(segments),
+        "blended": {k: blended[k] for k in
+                    ("spend", "ctr_link", "cpm", "cpc_link", "cpa_meta", "meta_roas")},
+        "segments": segments[:limit],
+        "note": "vs_blended = % difference from the blended average. cpm/cpa lower is "
+                "better; ctr/roas higher is better. Ranking fields are omitted by Meta "
+                "when a breakdown is applied.",
     })
 
 

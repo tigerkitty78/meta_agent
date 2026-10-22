@@ -1,0 +1,57 @@
+# =============================================================================
+# Nutrisulin — weekly Meta Ad Library competitor scan
+# =============================================================================
+# The MCP server can't call the Meta Ads connector itself (it's a claude.ai
+# remote connector bound to the user's session). So the weekly run is:
+#   1. competitor_scan_plan        -> the exact ads_library_search calls to make
+#   2. ads_library_search (connector), once per planned query
+#   3. ingest_ad_library_results   -> stores raw ads + writes competitor_notes
+#   4. weekly_report               -> includes the competitor_scan section
+#
+# Only observable Ad Library facts are derived: active ad count per page, new
+# ads launched, ad longevity (days running), headline/offer patterns. Never
+# competitor spend/CTR/CPA/ROAS — the Ad Library doesn't expose them.
+
+countries: [US]
+ad_active_status: ACTIVE
+limit_per_query: 50          # connector max is 50
+
+# Category sweeps: keyword searches over ad creative text.
+search_terms:
+  - blood sugar supplement
+  - berberine
+  - ceylon cinnamon blood sugar
+  - glucose support supplement
+  - insulin resistance supplement
+
+# Named competitors to track every week. page_id is optional: with one we
+# query by page; without one we search the brand name and keep only ads whose
+# page_name matches one of `match`.
+tracked:
+  - name: Glucocil
+    page_id: "148588841863900"
+    match: [glucocil]
+  - name: 1MD GlucoseMD
+    page_id: null
+    match: [1md]
+  - name: Dr. Berg Blood Sugar Support
+    page_id: null
+    match: [berg]
+  - name: Vthrive Dihydroberberine
+    page_id: null
+    match: [vthrive]
+  - name: Sandhu Products (berberine + Ceylon cinnamon)
+    page_id: null
+    match: [sandhu]
+
+# Keyword sweeps return off-topic ads (novels, coffee...). An ad from a
+# non-tracked page is kept only if its headline or page name hits one of these.
+relevance_keywords: [blood sugar, glucose, insulin, berberine, cinnamon, a1c,
+                     diabet, metabolic, glp, ozempic, sugar, gluco]
+
+# Our own pages — never reported as competitors.
+exclude_page_names: [nutrisulin, nutritunes]
+
+# Ads running at least this many days are flagged as "durable" (an advertiser
+# keeping an ad live that long is the closest public proxy for it working).
+durable_ad_days: 30

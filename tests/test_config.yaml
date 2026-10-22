@@ -1,0 +1,25 @@
+# Fixed config for the test suite — known values so target/verdict tests are deterministic.
+product:
+  product_id: NUTRISULIN_TEST
+  retail_price: 50.0
+
+unit_economics:
+  contribution_margin_ratio: 0.55
+
+targets:
+  cpa_target: 60
+  roas_floor: 1.0
+  contribution_target: 0
+
+decision_guardrails:
+  min_impressions: 1000
+  min_clicks: 50
+  min_purchases: 5
+  min_spend_multiple: 3.0
+  cooldown_hours: 24
+
+diagnostics:
+  ctr_material_drop_pct: 0.20
+  cpm_material_rise_pct: 0.20
+  cvr_material_drop_pct: 0.20
+  cpa_over_target_pct: 0.15

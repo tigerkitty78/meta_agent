@@ -101,6 +101,33 @@ CREATE TABLE IF NOT EXISTS competitor_notes (
     dedupe_key TEXT UNIQUE
 );
 CREATE INDEX IF NOT EXISTS ix_comp_time ON competitor_notes(captured_at);
+
+-- Meta Ad Library scans pulled through the Meta Ads connector (weekly run).
+CREATE TABLE IF NOT EXISTS ad_library_scans (
+    scan_id TEXT PRIMARY KEY,
+    scanned_at TEXT NOT NULL,
+    iso_week TEXT,
+    queries_json TEXT,                 -- query_ids run
+    ads_kept INTEGER,
+    drops_json TEXT,
+    summary_json TEXT
+);
+CREATE TABLE IF NOT EXISTS ad_library_ads (
+    ad_id TEXT PRIMARY KEY,
+    page_id TEXT,
+    page_name TEXT,
+    competitor TEXT,
+    link_title TEXT,
+    created_at TEXT,
+    delivery_start TEXT,
+    snapshot_url TEXT,
+    queries_json TEXT,
+    first_seen TEXT,
+    first_scan_id TEXT,
+    last_seen TEXT,
+    last_scan_id TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_adlib_scan ON ad_library_ads(last_scan_id);
 """
 
 
@@ -323,6 +350,65 @@ def insert_competitor_notes(rows: Iterable[dict[str, Any]]) -> int:
             except sqlite3.IntegrityError:
                 pass
     return new
+
+
+def replace_week_notes(source: str, rows: Iterable[dict[str, Any]]) -> int:
+    """Re-running a scan in the same ISO week replaces that week's notes from
+    `source` instead of piling up near-duplicates with updated counts."""
+    init_db()
+    with _conn() as con:
+        con.execute("DELETE FROM competitor_notes WHERE source = ? AND iso_week = ?",
+                    (source, _iso_week()))
+    return insert_competitor_notes(rows)
+
+
+def record_ad_library_scan(scan_id: str, query_ids: list[str], ads: list[dict[str, Any]],
+                           drops: dict[str, int]) -> None:
+    """Upsert scanned ads (keeping first_seen) and log the scan."""
+    init_db(); now = _now()
+    with _conn() as con:
+        for a in ads:
+            con.execute(
+                """INSERT INTO ad_library_ads
+                   (ad_id, page_id, page_name, competitor, link_title, created_at, delivery_start,
+                    snapshot_url, queries_json, first_seen, first_scan_id, last_seen, last_scan_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(ad_id) DO UPDATE SET
+                     page_name=excluded.page_name, competitor=excluded.competitor,
+                     link_title=excluded.link_title, queries_json=excluded.queries_json,
+                     last_seen=excluded.last_seen, last_scan_id=excluded.last_scan_id""",
+                (a["ad_id"], a["page_id"], a["page_name"], a["competitor"], a["link_title"],
+                 a["created_at"], a["delivery_start"], a["snapshot_url"], json.dumps(a["queries"]),
+                 now, scan_id, now, scan_id))
+        con.execute(
+            """INSERT OR REPLACE INTO ad_library_scans
+               (scan_id, scanned_at, iso_week, queries_json, ads_kept, drops_json)
+               VALUES (?,?,?,?,?,?)""",
+            (scan_id, now, _iso_week(), json.dumps(query_ids), len(ads), json.dumps(drops)))
+
+
+def set_scan_summary(scan_id: str, summary: dict[str, Any]) -> None:
+    with _conn() as con:
+        con.execute("UPDATE ad_library_scans SET summary_json = ? WHERE scan_id = ?",
+                    (json.dumps(summary, default=str), scan_id))
+
+
+def get_scan_ads(scan_id: str) -> list[dict[str, Any]]:
+    init_db()
+    with _conn() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM ad_library_ads WHERE last_scan_id = ?", (scan_id,)).fetchall()]
+
+
+def latest_ad_library_scan() -> dict[str, Any] | None:
+    init_db()
+    with _conn() as con:
+        r = con.execute("SELECT * FROM ad_library_scans ORDER BY scanned_at DESC LIMIT 1").fetchone()
+    return dict(r) if r else None
+
+
+def current_iso_week() -> str:
+    return _iso_week()
 
 
 def get_competitor_notes(since: str | None = None, competitor: str | None = None,

@@ -88,10 +88,33 @@ Restart Claude Desktop. The tools below appear under the 🔌 menu.
 | `explain_metric_move` | Cross-reference a metric rise/drop against logged changes — as a **cautious association**, with confounder flags. |
 | `store_meta_recommendations` | Persist Ads-Manager UI recommendations (High CPR, Opportunity hints) — **UI-only, not in the API**, so browser-captured. |
 | `show_meta_recommendations` | View stored UI recommendations. |
-| `store_competitor_notes` | Persist competitor observations (creative/offer/price) browsed from Ad Library site or storefronts — observable facts only. |
+| `competitor_scan_plan` | **Weekly step 1:** the Meta Ad Library queries (keyword sweeps + tracked brands, from `config/competitors.yaml`) to run through the Meta Ads connector's `ads_library_search`. |
+| `ingest_ad_library_results` | **Weekly step 2:** ingest the connector's raw results — filters off-topic/own ads, tracks first-seen, summarises per competitor (active/new/durable ads, headline & offer signals), refreshes this week's competitor notes. |
+| `store_competitor_notes` | Persist manual competitor observations (storefront prices/offers, ad body copy) — observable facts only. |
 | `show_competitor_notes` | View stored competitor observations. |
 | `weekly_report` | **One-call weekly analysis:** funnel gates + blended KPIs vs targets + per-campaign verdicts + change digest + stored recommendations + competitor notes. |
 | `explain_gates` | The six funnel gates with **full transparency** — atomic fields, formula, and the exact numbers substituted. |
+| `breakdown_kpis` | Split performance by **placement / platform / device / demographic / country / hour**, each vs the blended average — the wins blended KPIs hide. |
+
+## Breakdowns (what the blend hides)
+
+`breakdown_kpis` uses the same Insights API to split by a dimension and compare
+each segment to the blended average. Raw CTR isn't comparable across Reels, Feed
+and Stories, so each segment carries its `vs_blended` deltas (cpm/cpa lower is
+better; ctr/roas higher). `by`: `placement` (FB/IG × Feed/Reels/Stories),
+`platform`, `device`, `demographic` (age+gender), `country`, `hour`.
+
+## Tests
+
+A pytest suite covers the pure-logic modules (no network — synthetic insights
+rows): KPI math + divide-by-zero, own-baseline comparison & direction,
+SCALE/HOLD/FIX/STOP + cooldown, the gates (values, formulas, blocked states),
+Activity-Log legacy mapping + dedupe stability, and the fix playbook.
+
+```bash
+.venv/Scripts/python -m pip install -e ".[dev]"
+.venv/Scripts/python -m pytest
+```
 
 ## Funnel gates (with atomic-value transparency)
 
@@ -126,15 +149,33 @@ than folding the numbers into prose.
 - Ads-Manager recommendations ("High CPR", "N recommendations", Opportunity
   score) are **UI-only**. Confirmed: the API drops the `recommendations` field
   and the account `recommendations` edge is empty.
-- Competitor ad data isn't served by the Ad Library API for US commercial ads.
+- Competitor ads: the Graph API `ads_archive` doesn't serve US commercial ads,
+  but the **Meta Ads connector** (claude.ai remote MCP) does via `ads_library_search`.
 
-So those two are **browser-captured**: in a Claude session with the browser, read
-them off Ads Manager / the Ad Library site / competitor storefronts, then call
-`store_meta_recommendations` / `store_competitor_notes` to persist them. The
-server can't drive the browser itself, so this is a **capture step you run**, not
-a silent cron job. Once stored, every `weekly_report` includes them (deduped per
-ISO week). Competitor notes must be **observable facts only** — never claimed
-competitor CPA/CTR/ROAS (not knowable).
+Recommendations are **browser-captured**: read them off Ads Manager, then call
+`store_meta_recommendations`.
+
+### Weekly competitor step (Meta Ad Library via the Meta Ads connector)
+
+The connector is bound to the Claude session, so this server can't call it.
+The weekly run orchestrates it instead — `weekly_report` returns
+`competitor_scan.status` = `FRESH` / `STALE` / `NEVER_RUN` (fresh = scanned this
+ISO week) and, when not fresh, a `pre_run_required` instruction:
+
+1. `competitor_scan_plan` → list of `{query_id, args}`.
+2. For each, call the connector's `ads_library_search` with `args`.
+3. `ingest_ad_library_results(scans=[{query_id, results}, ...])` → stores ads in
+   `ad_library_ads`, logs `ad_library_scans`, replaces this week's
+   `meta_ad_library_connector` competitor notes.
+4. `weekly_report` → `competitor_scan` section (per competitor: active ads seen,
+   new this scan, ads running ≥ `durable_ad_days`, top headlines, offer signals).
+
+Edit `config/competitors.yaml` to change keywords, tracked brands (add a
+`page_id` to query a brand's whole page), relevance filter and own-page
+exclusions. The Ad Library exposes headline, page, start date and snapshot
+link only — no body copy, spend or impressions — so longevity is the only
+public proxy for a working ad. Manual notes (`store_competitor_notes`) are
+still included for storefront prices/offers.
 
 ## Memory (local SQLite store)
 
