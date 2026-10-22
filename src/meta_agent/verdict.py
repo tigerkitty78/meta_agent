@@ -87,9 +87,6 @@ def _select_fix_ids(level: str, verdict: str, tags: list[str]) -> list[str]:
         ids += [f["id"] for f in get_fixes("campaign", ["scale_ready"])]
     if "measurement_gate" in tagset:
         ids += [f["id"] for f in get_fixes("measurement")]
-    if "learning_limited" in tagset:
-        ids += [f["id"] for f in get_fixes("campaign", ["learning_limited"])]
-        ids += [f["id"] for f in get_fixes("adset", ["learning_limited"])]
     if tagset & {"ctr_down", "creative_fatigue"}:
         ids += [f["id"] for f in get_fixes("ad", ["ctr_down", "creative_fatigue"])]
     if "cpm_pressure" in tagset:
@@ -103,6 +100,11 @@ def _select_fix_ids(level: str, verdict: str, tags: list[str]) -> list[str]:
     if verdict in ("FIX", "STOP") and "over_target" in tagset:
         ids += [f["id"] for f in get_fixes("adset", ["over_target"])]
         ids += [f["id"] for f in get_fixes("campaign", ["structure"])]
+    # learning_limited fires on almost every small account (<50 purchases), so
+    # its generic fixes go last — callers truncate, and the driver's fixes must survive
+    if "learning_limited" in tagset:
+        ids += [f["id"] for f in get_fixes("campaign", ["learning_limited"])]
+        ids += [f["id"] for f in get_fixes("adset", ["learning_limited"])]
     # de-dupe, keep order, cap
     seen, out = set(), []
     for i in ids:

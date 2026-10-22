@@ -58,3 +58,13 @@ def test_stop_loss_over_target_with_spend():
     )
     v = rolling_verdict("campaign", rows, MARGIN, recent_days=7)
     assert v["verdict"] in ("STOP", "FIX")   # unprofitable; STOP once stop-loss conditions hold
+
+
+def test_driver_fixes_rank_ahead_of_learning_limited():
+    # learning_limited fires on nearly every small account; weekly_report keeps
+    # only the top 2 fixes, so the driver's (cvr/offer) fixes must come first
+    from meta_agent.fixes import get_fixes
+    from meta_agent.verdict import _select_fix_ids
+    ids = _select_fix_ids("campaign", "FIX", ["cvr_down", "learning_limited", "offer_issue"])
+    cvr_ids = [f["id"] for f in get_fixes("adset", ["cvr_down"])]
+    assert cvr_ids and ids[:len(cvr_ids)] == cvr_ids[:len(ids)]
