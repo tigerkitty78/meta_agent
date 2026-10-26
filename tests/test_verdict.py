@@ -44,6 +44,18 @@ def test_fix_when_creative_ctr_declines():
     assert v["fixes"]                      # matched playbook fixes attached
 
 
+def test_economics_gate_blocks_scale_without_margin():
+    # improving + ROAS clears the floor, but no contribution margin is set:
+    # breakeven is unknown, so SCALE must be withheld (audit G1).
+    rows = _series(
+        baseline_kw=dict(spend=100, impressions=10000, link_clicks=200, purchases=5, value=120),
+        recent_kw=dict(spend=100, impressions=10000, link_clicks=200, purchases=10, value=300),
+    )
+    v = rolling_verdict("campaign", rows, margin=None, recent_days=7)
+    assert v["verdict"] == "HOLD"
+    assert "economics gate" in v["reason"].lower()
+
+
 def test_hold_when_too_few_days():
     rows = mkdays(3)
     v = rolling_verdict("campaign", rows, MARGIN, recent_days=7)

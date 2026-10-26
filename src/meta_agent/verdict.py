@@ -199,9 +199,14 @@ def rolling_verdict(level: str, daily_rows: list[dict[str, Any]],
         driver_txt = ("overall efficiency down vs baseline; no single CPM/CTR/CVR driver isolated"
                       if driver == "no_material_driver" else f"driver: {driver}")
         verdict, reason = "FIX", f"Declining vs own baseline ({driver_txt}). Apply the matched fixes."
-    elif trend == "improving" and profitable is True:
+    elif trend == "improving" and profitable is True and margin is not None:
         verdict, reason = "SCALE", (f"Improving long-term ({trend_metric} favourable vs baseline) "
                                     f"and profitable ({prof_basis}). Scale within guardrails.")
+    elif trend == "improving" and profitable is True and margin is None:
+        # Economics gate (G1): a CPA/ROAS target can read 'profitable', but without a
+        # contribution margin the true breakeven is unknown — never SCALE on that.
+        verdict, reason = "HOLD", ("Economics gate (G1): would SCALE, but contribution_margin_ratio "
+                                   "is not set, so breakeven profit is unknown. Set it to unlock SCALE.")
     elif trend == "improving" and profitable is None:
         verdict, reason = "HOLD", ("Improving vs baseline but profitability is unconfirmed — set "
                                    "cpa_target/roas_floor or a contribution_margin_ratio to unlock SCALE.")

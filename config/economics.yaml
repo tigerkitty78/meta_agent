@@ -18,6 +18,10 @@ product:
   product_id: NUTRISULIN
   sku_ids: []
   currency: USD
+  # Reports are scoped to campaigns whose NAME contains any of these (case-
+  # insensitive), so one product's KPIs aren't blended with another's. Empty
+  # list = no scoping. Pass scope=false to a tool to see everything.
+  scope_name_contains: ["NUTRISULIN"]
   retail_price: null          # list price per unit
   sale_price: null
   subscription_price: null

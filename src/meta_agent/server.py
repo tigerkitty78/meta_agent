@@ -18,7 +18,8 @@ from mcp.server.fastmcp import FastMCP
 from . import __version__
 from .activity_log import normalize_many
 from .baselines import baseline_stats, compare_to_baseline, daily_series
-from .config import get_compliance, get_guardrails, load_economics
+from .config import (get_compliance, get_guardrails, get_product_scope,
+                     load_economics)
 from .diagnostics import evaluate_targets, evidence_sufficient, root_cause_tree
 from .fixes import DISCLAIMER, FIXES, get_fixes
 from .gates import compute_gates, gates_audit_block
@@ -47,6 +48,44 @@ def _err(msg: str) -> str:
 def _margin() -> float | None:
     ratio, _ = contribution_margin_ratio()
     return ratio
+
+
+# Objectives that count as acquisition (purchase). Everything else (traffic,
+# awareness, engagement) must not be judged on purchase CPA — see MISMATCH.
+ACQUISITION_OBJECTIVES = {"OUTCOME_SALES", "CONVERSIONS", "PRODUCT_CATALOG_SALES"}
+
+
+def _scope_filter(rows: list[dict], enabled: bool = True) -> tuple[list[dict], list[str]]:
+    """Keep only rows whose campaign_name matches the configured product scope.
+    Returns (kept, excluded_names). No scope / disabled -> all rows kept."""
+    tokens = [t.upper() for t in get_product_scope()]
+    if not enabled or not tokens:
+        return rows, []
+    kept, excluded = [], set()
+    for r in rows:
+        name = r.get("campaign_name") or ""
+        if any(t in name.upper() for t in tokens):
+            kept.append(r)
+        else:
+            excluded.add(name)
+    return kept, sorted(n for n in excluded if n)
+
+
+async def _campaign_objectives() -> dict[str, str]:
+    """campaign_id -> objective, for the MISMATCH check. Empty on error."""
+    try:
+        ents = await _client.list_entities("campaign", effective_status=None)
+    except MetaAPIError:
+        return {}
+    return {e.get("id"): e.get("objective") for e in ents if e.get("id")}
+
+
+def _is_acquisition(objective: str | None) -> bool:
+    return (objective or "").upper() in ACQUISITION_OBJECTIVES
+
+
+def _spend_of(rows: list[dict]) -> float:
+    return sum(float(r.get("spend") or 0) for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +181,7 @@ async def get_kpis(
     date_preset: str = "last_7d",
     entity_ids: list[str] | None = None,
     evaluate: bool = True,
+    scope: bool = True,
 ) -> str:
     """Compute the full KPI set at a given phase (campaign / adset / ad).
 
@@ -159,6 +199,7 @@ async def get_kpis(
         rows = await _client.get_insights(level, date_preset=date_preset, entity_ids=entity_ids)
     except MetaAPIError as exc:
         return _err(str(exc))
+    rows, _ = _scope_filter(rows, enabled=scope and not entity_ids)
 
     margin = _margin()
     id_field, name_field = LEVEL_ID_FIELD[level], LEVEL_NAME_FIELD[level]
@@ -265,17 +306,21 @@ async def diagnose_entity(
 # Account rollup
 # ---------------------------------------------------------------------------
 @mcp.tool()
-async def account_summary(date_preset: str = "last_7d") -> str:
+async def account_summary(date_preset: str = "last_7d", scope: bool = True) -> str:
     """Account-wide KPI rollup for the period: totals + blended CPA/ROAS/
-    contribution against configured targets. Good starting overview."""
+    contribution against configured targets. Scoped to the configured product by
+    default (set scope=false for the whole account)."""
     try:
         rows = await _client.get_insights("campaign", date_preset=date_preset)
     except MetaAPIError as exc:
         return _err(str(exc))
+    rows, out_of_scope = _scope_filter(rows, enabled=scope)
     margin = _margin()
     total_kpis = compute_kpis(aggregate_rows(rows), margin)
     return _dump({
         "date_preset": date_preset,
+        "product_scope": get_product_scope() if scope else [],
+        "out_of_scope_excluded": out_of_scope,
         "campaigns_included": len(rows),
         "blended_kpis": total_kpis,
         "target_evaluation": evaluate_targets(total_kpis),
@@ -290,6 +335,7 @@ async def recommend_action(
     window_days: int = 28,
     recent_days: int = 7,
     limit: int = 25,
+    scope: bool = True,
 ) -> str:
     """Rolling-average SCALE / HOLD / FIX / STOP verdict + matched fixes.
 
@@ -309,32 +355,42 @@ async def recommend_action(
             entity_ids=[entity_id] if entity_id else None)
     except MetaAPIError as exc:
         return _err(str(exc))
+    daily, out_of_scope = _scope_filter(daily, enabled=scope and not entity_id)
     if not daily:
-        return _err(f"No insights for {level}"
+        return _err(f"No in-scope insights for {level}"
                     + (f" {entity_id}" if entity_id else "") + f" in the last {window_days} days.")
 
     id_field, name_field = LEVEL_ID_FIELD[level], LEVEL_NAME_FIELD[level]
     groups: dict[str, list[dict]] = {}
     names: dict[str, str] = {}
+    cids: dict[str, str] = {}
     for row in daily:
         eid = row.get(id_field)
         if not eid:
             continue
         groups.setdefault(eid, []).append(row)
         names[eid] = row.get(name_field) or names.get(eid, "")
+        cids[eid] = row.get("campaign_id") or cids.get(eid)
 
+    spending = {e: rs for e, rs in groups.items() if _spend_of(rs) > 0}
+    skipped_no_spend = sorted(names.get(e) or e for e in groups if _spend_of(groups[e]) <= 0)
+    objectives = await _campaign_objectives()
     margin = _margin()
-    ranked = sorted(groups.items(),
-                    key=lambda kv: sum(float(r.get("spend") or 0) for r in kv[1]),
-                    reverse=True)[:limit]
+    ranked = sorted(spending.items(), key=lambda kv: _spend_of(kv[1]), reverse=True)[:limit]
 
     since_assoc, until_assoc = _period_dates(recent_days + 3)
     results = []
     for eid, rows in ranked:
+        cobj = objectives.get(eid if level == "campaign" else cids.get(eid))
+        if cobj is not None and not _is_acquisition(cobj):
+            results.append({"id": eid, "name": names.get(eid), "verdict": "MISMATCH",
+                            "objective": cobj,
+                            "reason": f"Objective is {cobj} (not purchase) - do not judge on "
+                                      "purchase CPA; treat as non-acquisition spend, or switch it to "
+                                      "a sales objective."})
+            continue
         hrs = _hours_since(store.last_change_time(level, eid, manual_only=True))
         v = rolling_verdict(level, rows, margin, recent_days, hours_since_last_edit=hrs)
-        # auto-attach the change-log association ONLY when there's an adverse
-        # move to explain (FIX/STOP). SCALE/HOLD stay clean.
         if v.get("verdict") in ("FIX", "STOP"):
             v["change_association"] = _change_association(
                 level, eid, since_assoc, until_assoc, metric=v.get("trend_metric"))
@@ -346,12 +402,16 @@ async def recommend_action(
         "window_days": window_days,
         "recent_days": recent_days,
         "contribution_margin_ratio": margin,
+        "product_scope": get_product_scope() if scope else [],
+        "out_of_scope_excluded": out_of_scope,
+        "skipped_no_spend": skipped_no_spend,
         "count": len(results),
         "verdict_legend": {
             "SCALE": "improving vs own baseline + profitable + enough evidence",
             "HOLD": "insufficient evidence, unconfirmed profitability, or no material change",
             "FIX": "declining vs baseline / unprofitable — apply matched fixes",
             "STOP": "materially over CPA target with enough spend (stop-loss)",
+            "MISMATCH": "objective isn't purchase - not judged on CPA",
         },
         "entities": results,
     })
@@ -784,7 +844,7 @@ def _competitor_scan_section() -> dict[str, Any]:
 
 @mcp.tool()
 async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = True,
-                        total_store_revenue: float | None = None) -> str:
+                        total_store_revenue: float | None = None, scope: bool = True) -> str:
     """The Meta weekly analysis, assembled in one call: the six funnel GATES
     (Visibility -> Click -> Conversion -> Paid Efficiency -> Ad Dependency ->
     Profit) with their atomic values and exact formulas, blended account KPIs vs
@@ -807,6 +867,8 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
         daily = await _client.get_insights("campaign", date_preset="last_28d", time_increment=1)
     except MetaAPIError as exc:
         return _err(str(exc))
+    daily, out_of_scope = _scope_filter(daily, enabled=scope)
+    objectives = await _campaign_objectives()
 
     margin = _margin()
     id_field, name_field = LEVEL_ID_FIELD["campaign"], LEVEL_NAME_FIELD["campaign"]
@@ -820,14 +882,27 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
         names[eid] = r.get(name_field) or names.get(eid, "")
 
     cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
-    recent_rows = [r for r in daily if (r.get("date_start") or "") >= cutoff]
+    # Blended = acquisition (purchase-objective) campaigns only, so a traffic
+    # campaign's clicks don't drag blended CVR (the audit's blended-mix problem).
+    acq_recent = [r for r in daily if (r.get("date_start") or "") >= cutoff
+                  and _is_acquisition(objectives.get(r.get("campaign_id")))]
+    recent_rows = acq_recent or [r for r in daily if (r.get("date_start") or "") >= cutoff]
     blended = compute_kpis(aggregate_rows(recent_rows), margin) if recent_rows else {}
 
     verdicts = []
+    skipped_no_spend: list[str] = []
     if include_verdicts:
-        ranked = sorted(groups.items(),
-                        key=lambda kv: sum(float(r.get("spend") or 0) for r in kv[1]), reverse=True)
+        spending = {e: rs for e, rs in groups.items() if _spend_of(rs) > 0}
+        skipped_no_spend = sorted(names.get(e) or e for e in groups if _spend_of(groups[e]) <= 0)
+        ranked = sorted(spending.items(), key=lambda kv: _spend_of(kv[1]), reverse=True)
         for eid, rows in ranked:
+            cobj = objectives.get(eid)
+            if cobj is not None and not _is_acquisition(cobj):
+                verdicts.append({"id": eid, "name": names.get(eid), "verdict": "MISMATCH",
+                                 "objective": cobj,
+                                 "reason": f"Objective is {cobj} (not purchase) - non-acquisition "
+                                           "spend; not judged on CPA."})
+                continue
             hrs = _hours_since(store.last_change_time("campaign", eid, manual_only=True))
             v = rolling_verdict("campaign", rows, margin, 7, hours_since_last_edit=hrs)
             recent_c = [r for r in rows if (r.get("date_start") or "") >= cutoff]
@@ -852,6 +927,9 @@ async def weekly_report(date_preset: str = "last_7d", include_verdicts: bool = T
     return _dump({
         "generated": datetime.now(timezone.utc).isoformat(),
         "period": date_preset,
+        "product_scope": get_product_scope() if scope else [],
+        "out_of_scope_excluded": out_of_scope,
+        "skipped_no_spend": skipped_no_spend,
         "gates_audit": gates_audit_block(gates_blended, "GATES (audit) — blended, last 7 days")
                        if gates_blended else None,
         "gates_blended": gates_blended,
@@ -921,7 +999,7 @@ BREAKDOWN_MAP = {
 @mcp.tool()
 async def breakdown_kpis(by: str = "placement", level: str = "campaign",
                          entity_id: str | None = None, date_preset: str = "last_7d",
-                         limit: int = 15) -> str:
+                         limit: int = 15, scope: bool = True) -> str:
     """Split performance by a dimension the blended KPIs hide, and compare each
     segment to the blended average.
 
@@ -943,8 +1021,9 @@ async def breakdown_kpis(by: str = "placement", level: str = "campaign",
             entity_ids=[entity_id] if entity_id else None)
     except MetaAPIError as exc:
         return _err(str(exc))
+    rows, _ = _scope_filter(rows, enabled=scope and not entity_id)
     if not rows:
-        return _err(f"No insights for a {by} breakdown ({level}, {date_preset}).")
+        return _err(f"No in-scope insights for a {by} breakdown ({level}, {date_preset}).")
 
     margin = _margin()
     groups: dict[tuple, list[dict]] = {}

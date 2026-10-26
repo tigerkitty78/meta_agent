@@ -233,6 +233,20 @@ target checks, evidence and safety gates:
 Measurement is a **gate**: if tracking looks broken (clicks but no LPV), the
 verdict is FIX(measurement) and scaling is frozen regardless of apparent numbers.
 
+**Audit-driven refinements:**
+- **Product scoping** — reports are scoped to the configured product
+  (`product.scope_name_contains` in economics.yaml, e.g. `["NUTRISULIN"]`) so one
+  product's KPIs aren't blended with another's. Pass `scope=false` to any tool to
+  see the whole account. Applies to `get_kpis`, `account_summary`,
+  `recommend_action`, `weekly_report`, `breakdown_kpis`.
+- **Economics gate (G1)** — SCALE now requires a `contribution_margin_ratio`; a
+  CPA/ROAS target alone can't confirm breakeven, so the verdict holds without it.
+- **MISMATCH** — a non-purchase-objective campaign (traffic/awareness) returns
+  MISMATCH, not a CPA verdict — it isn't acquisition spend.
+- **No-spend skip** — entities with zero spend in the window are listed, not
+  judged (no gates recomputed for them); `weekly_report`'s blended KPIs use only
+  purchase-objective campaigns so a traffic campaign's clicks don't drag CVR.
+
 ## FIX playbook
 
 `get_fix_playbook` returns researched, **sourced** best-practice fixes per level

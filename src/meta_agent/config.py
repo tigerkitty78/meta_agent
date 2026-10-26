@@ -83,3 +83,13 @@ def get_unit_economics() -> dict[str, Any]:
 
 def get_compliance() -> dict[str, Any]:
     return load_economics().get("compliance", {}) or {}
+
+
+def get_product_scope() -> list[str]:
+    """Case-insensitive name tokens that scope reports to one product.
+    Empty list = no scoping (every entity). Keeps one product's blended KPIs
+    from being polluted by another's (the audit's 'measure each product alone')."""
+    scope = (load_economics().get("product", {}) or {}).get("scope_name_contains")
+    if not scope:
+        return []
+    return [str(s) for s in scope]
